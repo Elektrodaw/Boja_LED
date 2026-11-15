@@ -1,7 +1,8 @@
 /*
- * NADAJNIK (MASTER) ESP32 - ESP-NOW + WebServer
- * Maksymalna moc TX, monitoring statusu Online/Offline, przyciski R/G/B
- * + Watchdog połączenia przeglądarka <-> Master (timeout 5s)
+ * NADAJNIK (MASTER) ESP32 - ESP-NOW + WebServer (Tryb AP)
+ * Funkcje: Maksymalna moc TX (+19.5 dBm), status Online/Offline,
+ * kolory stałe R/G/B, tryby migania 1s ON / 1s OFF dla każdego koloru,
+ * stroboskop Syreny Policyjnej oraz Watchdog połączenia (5s).
  */
 #include <WiFi.h>
 #include <WebServer.h>
@@ -11,11 +12,41 @@
 // KONFIGURACJA SIECI NADAJNIKA
 // =======================================================
 const char* apSSID = "System_LED_Master";
-const char* apPass = "solar";
+const char* apPass = "SekretneHaslo123";
 const int WIFI_CHANNEL = 1; // Sztywny kanał dla AP i ESP-NOW
 
 // =======================================================
-// KONFIGURACJA ODBIORNIKÓW (SLAVES - ESP8266)
+// PARAMETRY ANIMACJI I TRYBÓW PRACY
+// =======================================================
+const unsigned long BLINK_INTERVAL_MS = 1000; // 1s ON / 1s OFF
+
+enum EffectMode {
+  MODE_SOLID = 0, // Światło ciągłe
+  MODE_BLINK = 1, // Miganie 1s ON / 1s OFF dla wybranego koloru
+  MODE_SIREN = 2  // Stroboskop policyjny R/B
+};
+
+struct SirenFrame {
+  uint8_t r;
+  uint8_t g;
+  uint8_t b;
+  uint16_t duration;
+};
+
+const SirenFrame SIREN_PATTERN[] = {
+  {255, 0, 0, 80},   // Czerwony błysk 1
+  {0, 0, 0, 60},     // Krótka przerwa
+  {255, 0, 0, 80},   // Czerwony błysk 2
+  {0, 0, 0, 130},    // Pauza przed zmianą barwy
+  {0, 0, 255, 80},   // Niebieski błysk 1
+  {0, 0, 0, 60},     // Krótka przerwa
+  {0, 0, 255, 80},   // Niebieski błysk 2
+  {0, 0, 0, 130}     // Pauza przed kolejnym cyklem
+};
+const int SIREN_FRAMES_COUNT = sizeof(SIREN_PATTERN) / sizeof(SIREN_PATTERN[0]);
+
+// =======================================================
+// KONFIGURACJA ODBIORNIKÓW (SLAVES)
 // =======================================================
 struct SlaveDevice {
   uint8_t mac[6];
@@ -24,9 +55,12 @@ struct SlaveDevice {
   uint8_t lastR;
   uint8_t lastG;
   uint8_t lastB;
+  EffectMode mode;
+  uint8_t animStep;
+  unsigned long lastAnimTime;
 };
 
-// Zaktualizuj adresy MAC na te odczytane z Twoich Wemosów
+// Zaktualizuj adresy MAC na te odczytane z Twoich odbiorników
 const int NUM_SLAVES = 5;
 SlaveDevice slaves[NUM_SLAVES] = {
   {{0xec, 0xfa, 0xbc, 0x28, 0x5c, 0x21}, "Boja 1"}, //ec:fa:bc:28:5c:21
@@ -36,7 +70,7 @@ SlaveDevice slaves[NUM_SLAVES] = {
   {{0x00, 0x00, 0x00, 0x00, 0x00, 0x00}, "Boja 2"}  //empty
 };
 
-// Struktura pakietu danych
+// Struktura pakietu danych ESP-NOW
 typedef struct struct_message {
   uint8_t r;
   uint8_t g;
@@ -45,7 +79,7 @@ typedef struct struct_message {
 
 WebServer server(80);
 unsigned long lastPingTime = 0;
-const unsigned long PING_INTERVAL = 3000; // Sprawdzanie połączenia ze Slave'ami co 3 sekundy
+const unsigned long PING_INTERVAL = 3000;
 
 // =======================================================
 // CALLBACK POTWIERDZENIA DOSTARCZENIA (ACK)
@@ -87,17 +121,34 @@ const char index_html[] PROGMEM = R"rawliteral(
     .offline .dot { background: #f44336; box-shadow: 0 0 8px #f44336; }
     .offline { color: #e57373; }
     .controls { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
-    input[type="color"] { width: 60px; height: 45px; border: none; outline: none; background: transparent; cursor: pointer; }
-    .btn-group { display: flex; gap: 8px; flex-wrap: wrap; }
-    button { color: white; border: none; padding: 10px 14px; border-radius: 6px; font-weight: bold; cursor: pointer; transition: 0.15s; font-size: 0.9rem; }
+    .effects-row { margin-top: 12px; padding-top: 12px; border-top: 1px dashed #333; display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap; }
+    .row-label { font-size: 0.78rem; color: #9e9e9e; text-transform: uppercase; letter-spacing: 0.5px; width: 100%; margin-bottom: 2px; }
+    input[type="color"] { width: 55px; height: 42px; border: none; outline: none; background: transparent; cursor: pointer; }
+    .btn-group { display: flex; gap: 7px; flex-wrap: wrap; }
+    button { color: white; border: 1px solid transparent; padding: 9px 12px; border-radius: 6px; font-weight: bold; cursor: pointer; transition: 0.15s; font-size: 0.84rem; }
     button:active { transform: scale(0.94); }
     .btn-r { background: #c62828; }
     .btn-g { background: #2e7d32; }
     .btn-b { background: #1565c0; }
-    .btn-off { background: #424242; border: 1px solid #616161; }
+    .btn-blink-r { background: #7f1d1d; border-color: #ef5350; }
+    .btn-blink-g { background: #1b5e20; border-color: #66bb6a; }
+    .btn-blink-b { background: #0d47a1; border-color: #42a5f5; }
+    .btn-blink-c { background: #37474f; border-color: #90a4ae; }
+    .btn-siren { background: linear-gradient(135deg, #c62828 50%, #1565c0 50%); border-color: #666; }
+    .btn-off { background: #424242; border-color: #616161; }
+
+    /* Animacja aktywnego trybu migania / syreny */
+    button.active {
+      border: 2px solid #ffffff !important;
+      animation: btnPulse 1s infinite alternate;
+    }
+    @keyframes btnPulse {
+      0% { opacity: 1; box-shadow: 0 0 10px rgba(255, 255, 255, 0.75); }
+      100% { opacity: 0.65; box-shadow: 0 0 2px rgba(255, 255, 255, 0.2); }
+    }
+
     .loader { text-align: center; margin-top: 50px; color: #888; }
 
-    /* Pełnoekranowy komunikat o utracie połączenia */
     #connection-overlay {
       display: none;
       position: fixed;
@@ -134,12 +185,11 @@ const char index_html[] PROGMEM = R"rawliteral(
   </style>
 </head>
 <body>
-  <!-- Nakładka błędu połączenia -->
   <div id="connection-overlay">
     <div class="error-box">
       <div class="spinner"></div>
       <h3>Utracono połączenie!</h3>
-      <p>Brak odpowiedzi z jednostki głównej (ESP32) od ponad 5 sekund.<br><br>Sprawdź połączenie z siecią Wi-Fi <strong>System_LED_Master</strong>. Panel wróci automatycznie po odzyskaniu łączności.</p>
+      <p>Brak odpowiedzi z jednostki głównej (ESP32) od ponad 5 sekund.<br><br>Sprawdź połączenie z siecią Wi-Fi <strong>System_LED_Master</strong>. Panel wróci automatycznie.</p>
     </div>
   </div>
 
@@ -152,7 +202,6 @@ const char index_html[] PROGMEM = R"rawliteral(
     let lastSuccessTime = Date.now();
     let isInitialized = false;
 
-    // Fetch z limitem czasu (timeout), aby zerwane połączenie nie wisiało w nieskończoność
     async function fetchWithTimeout(resource, options = {}) {
       const { timeout = 2000 } = options;
       const controller = new AbortController();
@@ -165,7 +214,37 @@ const char index_html[] PROGMEM = R"rawliteral(
       return response;
     }
 
+    function rgbToHex(r, g, b) {
+      return "#" + [r, g, b].map(x => x.toString(16).padStart(2, '0')).join('');
+    }
+
+    function clearEffectHighlights(id) {
+      ['blink_r_', 'blink_g_', 'blink_b_', 'blink_c_', 'siren_'].forEach(prefix => {
+        const el = document.getElementById(prefix + id);
+        if (el) el.classList.remove('active');
+      });
+    }
+
+    function applyEffectHighlights(dev) {
+      clearEffectHighlights(dev.id);
+      if (dev.mode === 2) {
+        const el = document.getElementById('siren_' + dev.id);
+        if (el) el.classList.add('active');
+      } else if (dev.mode === 1) {
+        if (dev.r === 255 && dev.g === 0 && dev.b === 0) {
+          document.getElementById('blink_r_' + dev.id)?.classList.add('active');
+        } else if (dev.r === 0 && dev.g === 255 && dev.b === 0) {
+          document.getElementById('blink_g_' + dev.id)?.classList.add('active');
+        } else if (dev.r === 0 && dev.g === 0 && dev.b === 255) {
+          document.getElementById('blink_b_' + dev.id)?.classList.add('active');
+        } else {
+          document.getElementById('blink_c_' + dev.id)?.classList.add('active');
+        }
+      }
+    }
+
     function sendColorRequest(id, r, g, b) {
+      clearEffectHighlights(id);
       fetchWithTimeout(`/set?id=${id}&r=${r}&g=${g}&b=${b}`, { timeout: 1500 })
         .then(res => {
           if (res.ok) {
@@ -201,12 +280,51 @@ const char index_html[] PROGMEM = R"rawliteral(
       sendColorRequest(id, r, g, b);
     }
 
+    function startBlink(id, r, g, b, hex) {
+      document.getElementById('color_' + id).value = hex;
+      fetchWithTimeout(`/blink?id=${id}&r=${r}&g=${g}&b=${b}`, { timeout: 1500 })
+        .then(res => {
+          if (res.ok) {
+            lastSuccessTime = Date.now();
+            checkConnectionHealth();
+            syncWithMaster();
+          }
+        })
+        .catch(err => console.warn("Błąd uruchamiania migania:", err));
+    }
+
+    function startBlinkFromPicker(id) {
+      let hex = document.getElementById('color_' + id).value;
+      // Jeśli wybrano czarny (#000000), ustaw domyślnie biały, aby miganie było widoczne
+      if (hex === '#000000') {
+        hex = '#ffffff';
+        document.getElementById('color_' + id).value = hex;
+      }
+      const r = parseInt(hex.slice(1, 3), 16);
+      const g = parseInt(hex.slice(3, 5), 16);
+      const b = parseInt(hex.slice(5, 7), 16);
+      startBlink(id, r, g, b, hex);
+    }
+
+    function toggleSiren(id) {
+      fetchWithTimeout(`/siren?id=${id}`, { timeout: 1500 })
+        .then(res => {
+          if (res.ok) {
+            lastSuccessTime = Date.now();
+            checkConnectionHealth();
+            syncWithMaster();
+          }
+        })
+        .catch(err => console.warn("Błąd przełączania syreny:", err));
+    }
+
     function renderDevices(data) {
       const app = document.getElementById('app');
       app.innerHTML = '';
       data.forEach(dev => {
         const statusClass = dev.online ? 'online' : 'offline';
         const statusText = dev.online ? 'Online' : 'Offline';
+        const initialHex = rgbToHex(dev.r, dev.g, dev.b);
         app.innerHTML += `
           <div class="card">
             <div class="header">
@@ -216,7 +334,7 @@ const char index_html[] PROGMEM = R"rawliteral(
               </span>
             </div>
             <div class="controls">
-              <input type="color" id="color_${dev.id}" value="#000000" oninput="throttleSend(${dev.id}, this.value)">
+              <input type="color" id="color_${dev.id}" value="${initialHex}" oninput="throttleSend(${dev.id}, this.value)">
               <div class="btn-group">
                 <button class="btn-r" onclick="setQuickColor(${dev.id}, 255, 0, 0, '#ff0000')">R</button>
                 <button class="btn-g" onclick="setQuickColor(${dev.id}, 0, 255, 0, '#00ff00')">G</button>
@@ -224,8 +342,19 @@ const char index_html[] PROGMEM = R"rawliteral(
                 <button class="btn-off" onclick="setQuickColor(${dev.id}, 0, 0, 0, '#000000')">WYŁĄCZ</button>
               </div>
             </div>
+            <div class="effects-row">
+              <div class="row-label">Tryby migania (1s ON / 1s OFF) i efekty</div>
+              <div class="btn-group">
+                <button id="blink_r_${dev.id}" class="btn-blink-r" onclick="startBlink(${dev.id}, 255, 0, 0, '#ff0000')">Migaj R</button>
+                <button id="blink_g_${dev.id}" class="btn-blink-g" onclick="startBlink(${dev.id}, 0, 255, 0, '#00ff00')">Migaj G</button>
+                <button id="blink_b_${dev.id}" class="btn-blink-b" onclick="startBlink(${dev.id}, 0, 0, 255, '#0000ff')">Migaj B</button>
+                <button id="blink_c_${dev.id}" class="btn-blink-c" onclick="startBlinkFromPicker(${dev.id})">Migaj Kolor</button>
+                <button id="siren_${dev.id}" class="btn-siren" onclick="toggleSiren(${dev.id})">POLICJA</button>
+              </div>
+            </div>
           </div>
         `;
+        applyEffectHighlights(dev);
       });
       isInitialized = true;
     }
@@ -237,7 +366,6 @@ const char index_html[] PROGMEM = R"rawliteral(
           return res.json();
         })
         .then(data => {
-          // Sukces - aktualizujemy znacznik czasu połączenia
           lastSuccessTime = Date.now();
           checkConnectionHealth();
 
@@ -250,11 +378,11 @@ const char index_html[] PROGMEM = R"rawliteral(
                 badge.className = 'status ' + (dev.online ? 'online' : 'offline');
                 badge.innerHTML = `<span class="dot"></span>${dev.online ? 'Online' : 'Offline'}`;
               }
+              applyEffectHighlights(dev);
             });
           }
         })
         .catch(() => {
-          // Brak odpowiedzi - sprawdzamy czy minęło > 5s
           checkConnectionHealth();
         });
     }
@@ -268,12 +396,8 @@ const char index_html[] PROGMEM = R"rawliteral(
       }
     }
 
-    // Pierwsze pobranie od razu po załadowaniu
     syncWithMaster();
-
-    // Cykliczne odpytywanie Mastera co 2 sekundy (pozwala precyzyjnie wykryć 5-sekundowy zanik)
     setInterval(syncWithMaster, 2000);
-    // Niezależny zegar sprawdzający przekroczenie 5 sekund na wypadek zawieszenia żądania
     setInterval(checkConnectionHealth, 1000);
   </script>
 </body>
@@ -281,14 +405,18 @@ const char index_html[] PROGMEM = R"rawliteral(
 )rawliteral";
 
 // =======================================================
-// FUNKCJA POMOCNICZA WYSYŁANIA STANU DO SLAVE'A
+// FUNKCJE POMOCNICZE WYSYŁANIA DANYCH DO SLAVE'A
 // =======================================================
-void sendPayloadToSlave(int id) {
+void sendRGB(int id, uint8_t r, uint8_t g, uint8_t b) {
   struct_message payload;
-  payload.r = slaves[id].lastR;
-  payload.g = slaves[id].lastG;
-  payload.b = slaves[id].lastB;
+  payload.r = r;
+  payload.g = g;
+  payload.b = b;
   esp_now_send(slaves[id].mac, (uint8_t *) &payload, sizeof(payload));
+}
+
+void sendSteadyStateToSlave(int id) {
+  sendRGB(id, slaves[id].lastR, slaves[id].lastG, slaves[id].lastB);
 }
 
 // =======================================================
@@ -298,12 +426,12 @@ void setup() {
   Serial.begin(115200);
   Serial.println("\nInicjalizacja Mastera (ESP32)...");
 
-  // 1. Konfiguracja Wi-Fi
+  // 1. Konfiguracja Wi-Fi (Access Point)
   WiFi.mode(WIFI_AP_STA);
   WiFi.softAP(apSSID, apPass, WIFI_CHANNEL, 0, 4);
   WiFi.disconnect();
 
-  // Wymuszenie maksymalnej mocy nadawania radia (+19.5 dBm)
+  // Maksymalna moc nadawania radia (+19.5 dBm)
   WiFi.setTxPower(WIFI_POWER_19_5dBm);
 
   Serial.print("Access Point uruchomiony. IP: ");
@@ -315,7 +443,6 @@ void setup() {
     return;
   }
 
-  // Rejestracja funkcji sprawdzającej dostarczenie pakietu (status połączenia)
   esp_now_register_send_cb(onDataSent);
 
   // 3. Rejestracja Odbiorników (Peers)
@@ -340,13 +467,18 @@ void setup() {
     for (int i = 0; i < NUM_SLAVES; i++) {
       json += "{\"id\":" + String(i) + 
               ",\"name\":\"" + slaves[i].name + "\"" +
-              ",\"online\":" + (slaves[i].online ? "true" : "false") + "}";
+              ",\"online\":" + (slaves[i].online ? "true" : "false") +
+              ",\"mode\":" + String((int)slaves[i].mode) +
+              ",\"r\":" + String(slaves[i].lastR) +
+              ",\"g\":" + String(slaves[i].lastG) +
+              ",\"b\":" + String(slaves[i].lastB) + "}";
       if (i < NUM_SLAVES - 1) json += ",";
     }
     json += "]";
     server.send(200, "application/json", json);
   });
 
+  // Ustawienie stałego koloru (wyłącza tryby migania oraz syrenę)
   server.on("/set", HTTP_GET, []() {
     if (!server.hasArg("id") || !server.hasArg("r") || !server.hasArg("g") || !server.hasArg("b")) {
       server.send(400, "text/plain", "Bad Request");
@@ -355,11 +487,60 @@ void setup() {
     
     int id = server.arg("id").toInt();
     if (id >= 0 && id < NUM_SLAVES) {
-      slaves[id].lastR = server.arg("r").toInt();
-      slaves[id].lastG = server.arg("g").toInt();
-      slaves[id].lastB = server.arg("b").toInt();
+      slaves[id].mode = MODE_SOLID;
+      slaves[id].lastR = constrain(server.arg("r").toInt(), 0, 255);
+      slaves[id].lastG = constrain(server.arg("g").toInt(), 0, 255);
+      slaves[id].lastB = constrain(server.arg("b").toInt(), 0, 255);
       
-      sendPayloadToSlave(id);
+      sendSteadyStateToSlave(id);
+      server.send(200, "text/plain", "OK");
+    } else {
+      server.send(400, "text/plain", "Invalid ID");
+    }
+  });
+
+  // Uruchomienie migania 1s ON / 1s OFF dla zadanego koloru
+  server.on("/blink", HTTP_GET, []() {
+    if (!server.hasArg("id") || !server.hasArg("r") || !server.hasArg("g") || !server.hasArg("b")) {
+      server.send(400, "text/plain", "Bad Request");
+      return;
+    }
+
+    int id = server.arg("id").toInt();
+    if (id >= 0 && id < NUM_SLAVES) {
+      slaves[id].mode = MODE_BLINK;
+      slaves[id].lastR = constrain(server.arg("r").toInt(), 0, 255);
+      slaves[id].lastG = constrain(server.arg("g").toInt(), 0, 255);
+      slaves[id].lastB = constrain(server.arg("b").toInt(), 0, 255);
+      slaves[id].animStep = 0; // Klatka 0 = ON
+      slaves[id].lastAnimTime = millis();
+
+      // Natychmiastowe zapalenie diody w fazie ON
+      sendRGB(id, slaves[id].lastR, slaves[id].lastG, slaves[id].lastB);
+      server.send(200, "text/plain", "OK");
+    } else {
+      server.send(400, "text/plain", "Invalid ID");
+    }
+  });
+
+  // Przełączanie trybu Syreny Policyjnej
+  server.on("/siren", HTTP_GET, []() {
+    if (!server.hasArg("id")) {
+      server.send(400, "text/plain", "Bad Request");
+      return;
+    }
+    
+    int id = server.arg("id").toInt();
+    if (id >= 0 && id < NUM_SLAVES) {
+      if (slaves[id].mode == MODE_SIREN) {
+        slaves[id].mode = MODE_SOLID;
+        sendSteadyStateToSlave(id);
+      } else {
+        slaves[id].mode = MODE_SIREN;
+        slaves[id].animStep = 0;
+        slaves[id].lastAnimTime = millis();
+        sendRGB(id, SIREN_PATTERN[0].r, SIREN_PATTERN[0].g, SIREN_PATTERN[0].b);
+      }
       server.send(200, "text/plain", "OK");
     } else {
       server.send(400, "text/plain", "Invalid ID");
@@ -372,11 +553,44 @@ void setup() {
 
 void loop() {
   server.handleClient();
+  unsigned long now = millis();
 
-  if (millis() - lastPingTime >= PING_INTERVAL) {
-    lastPingTime = millis();
+  // 1. Obsługa aktywnych animacji (Miganie 1s/1s oraz Syrena Policyjna)
+  for (int i = 0; i < NUM_SLAVES; i++) {
+    if (slaves[i].mode == MODE_BLINK) {
+      if (now - slaves[i].lastAnimTime >= BLINK_INTERVAL_MS) {
+        slaves[i].lastAnimTime = now;
+        slaves[i].animStep = (slaves[i].animStep == 0) ? 1 : 0;
+
+        if (slaves[i].animStep == 0) {
+          // Faza 1s ON
+          sendRGB(i, slaves[i].lastR, slaves[i].lastG, slaves[i].lastB);
+        } else {
+          // Faza 1s OFF
+          sendRGB(i, 0, 0, 0);
+        }
+      }
+    } 
+    else if (slaves[i].mode == MODE_SIREN) {
+      if (now - slaves[i].lastAnimTime >= SIREN_PATTERN[slaves[i].animStep].duration) {
+        slaves[i].animStep = (slaves[i].animStep + 1) % SIREN_FRAMES_COUNT;
+        slaves[i].lastAnimTime = now;
+        sendRGB(i, 
+                SIREN_PATTERN[slaves[i].animStep].r, 
+                SIREN_PATTERN[slaves[i].animStep].g, 
+                SIREN_PATTERN[slaves[i].animStep].b);
+      }
+    }
+  }
+
+  // 2. Heartbeat co 3 sekundy (tylko dla stref w trybie światła ciągłego;
+  //    strefy migające i z syreną odświeżają status Online/Offline przy każdej zmianie klatki)
+  if (now - lastPingTime >= PING_INTERVAL) {
+    lastPingTime = now;
     for (int i = 0; i < NUM_SLAVES; i++) {
-      sendPayloadToSlave(i);
+      if (slaves[i].mode == MODE_SOLID) {
+        sendSteadyStateToSlave(i);
+      }
     }
   }
 }
