@@ -1,23 +1,19 @@
 /*
- * NARZĘDZIE POMOCNICZE: Odczyt adresu MAC
- * Wgraj na każdą płytkę Slave i otwórz Serial Monitor (115200 baud).
+ * NARZĘDZIE POMOCNICZE: Odczyt adresu MAC dla ESP32 / ESP32-C3
+ * W Arduino IDE ustaw: Tools -> USB CDC On Boot -> Enabled
  */
-#include <ESP8266WiFi.h>
+#include <WiFi.h>
 
 void setup() {
-  Serial.begin(115200);
-  delay(1000);
+  Serial.begin(9600);
   
-  // Ustawienie trybu stacji, aby odczytać poprawny MAC
+  // Inicjalizacja modułu Wi-Fi w trybie stacji (wymagane przed odczytem MAC)
   WiFi.mode(WIFI_STA);
-  
-  Serial.println();
-  Serial.println("=====================================");
-  Serial.print("Adres MAC tej płytki: ");
-  Serial.println(WiFi.macAddress());
-  Serial.println("=====================================");
+  delay(500);
 }
 
 void loop() {
-  // Pusta pętla
+  Serial.print("Adres MAC ESP32-C3: ");
+  Serial.println(WiFi.macAddress());
+  delay(2000);
 }

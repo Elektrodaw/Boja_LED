@@ -1,19 +1,22 @@
 /*
- * ODBIORNIK (SLAVE) - ESP-NOW
- * Sterowanie taśmą LED RGB
+ * ODBIORNIK (SLAVE) - ESP32-C3 (Super Mini / Super Mini Plus)
+ * Sterowanie analogową taśmą LED RGB (MOSFET) po protokole ESP-NOW
+ * Piny: GPIO2 (R), GPIO3 (G), GPIO4 (B)
  */
-#include <ESP8266WiFi.h>
-#include <espnow.h>
-extern "C" {
-  #include <user_interface.h> // Wymagane do ręcznej zmiany kanału Wi-Fi
-}
+#include <WiFi.h>
+#include <esp_now.h>
+#include <esp_wifi.h>
 
-// Konfiguracja pinów pod MOSFETy
-#define PIN_R 5 // GPIO3 (sprzętowy RX)
-#define PIN_G 4 // GPIO4 (D2)
-#define PIN_B 3 // GPIO5 (D1)
+// =======================================================
+// KONFIGURACJA SPRZĘTOWA I RADIOWA
+// =======================================================
+#define PIN_R 3 // GPIO2 - Kanał czerwony (R)
+#define PIN_G 4 // GPIO3 - Kanał zielony (G)
+#define PIN_B 2 // GPIO4 - Kanał niebieski (B)
 
-// Struktura pakietu danych (musi być identyczna na Nadajniku i Odbiorniku)
+#define WIFI_CHANNEL 1 // Musi być identyczny jak w Masterze
+
+// Struktura pakietu danych (identyczna jak w kodzie Mastera)
 typedef struct struct_message {
   uint8_t r;
   uint8_t g;
@@ -22,61 +25,94 @@ typedef struct struct_message {
 
 struct_message myData;
 
-// Callback wywoływany przy odbiorze danych przez ESP-NOW
-void onDataRecv(uint8_t *mac, uint8_t *incomingData, uint8_t len) {
+// =======================================================
+// CALLBACK ODBIORU DANYCH ESP-NOW (Rdzeń ESP32 v2.x i v3.x)
+// =======================================================
+#if ESP_ARDUINO_VERSION >= ESP_ARDUINO_VERSION_VAL(3, 0, 0)
+void onDataRecv(const esp_now_recv_info_t *info, const uint8_t *incomingData, int len) {
+#else
+void onDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len) {
+#endif
   if (len == sizeof(myData)) {
     memcpy(&myData, incomingData, sizeof(myData));
-    
-    // Ustawienie wypełnienia PWM dla poszczególnych kanałów (0-255)
+
+    // Sprzętowy kontroler LEDC na ESP32 domyślnie pracuje w zakresie 8-bit (0-255)
     analogWrite(PIN_R, myData.r);
     analogWrite(PIN_G, myData.g);
     analogWrite(PIN_B, myData.b);
   }
 }
 
+// =======================================================
+// INICJALIZACJA SYSTEMU
+// =======================================================
 void setup() {
-  // UWAGA: Celowo NIE wywołujemy Serial.begin(), 
-  // aby nie zakłócać sygnału PWM na pinie GPIO3 (RX).
-  
+  // Bezpieczna inicjalizacja portu szeregowego przez natywne USB-C
+  Serial.begin(115200);
+
+  // Konfiguracja wyjść PWM
   pinMode(PIN_R, OUTPUT);
   pinMode(PIN_G, OUTPUT);
   pinMode(PIN_B, OUTPUT);
 
-  // Dostosowanie zakresu PWM do standardu 8-bitowego RGB (0-255)
-  // Domyślnie ESP8266 używa zakresu 0-1023.
-  analogWriteRange(255);
-  
-  // Stan początkowy - wyłączone
+  // Stan początkowy po podaniu zasilania - taśma wygaszona
   analogWrite(PIN_R, 0);
   analogWrite(PIN_G, 0);
   analogWrite(PIN_B, 0);
+  delay(1000);
+  analogWrite(PIN_R, 1);
+  analogWrite(PIN_G, 0);
+  analogWrite(PIN_B, 0);
+  delay(1000);
+  analogWrite(PIN_R, 0);
+  analogWrite(PIN_G, 1);
+  analogWrite(PIN_B, 0);
+  delay(1000);
+  analogWrite(PIN_R, 0);
+  analogWrite(PIN_G, 0);
+  analogWrite(PIN_B, 1);
+  delay(1000);
+  analogWrite(PIN_R, 0);
+  analogWrite(PIN_G, 1);
+  analogWrite(PIN_B, 0);
+  delay(1000);
 
-  // Konfiguracja Wi-Fi
+  // Konfiguracja modułu radiowego
   WiFi.mode(WIFI_STA);
-  WiFi.disconnect(); // Rozłączamy się z ewentualnymi sieciami
+  WiFi.disconnect();
 
-  // Sztywne ustawienie kanału (musi być ten sam co w Masterze - np. kanał 1)
-  wifi_promiscuous_enable(1);
-  wifi_set_channel(1);
-  wifi_promiscuous_enable(0);
+  // Wyłączenie uśpienia modemu dla natychmiastowej reakcji na szybkie błyski (syrena)
+  WiFi.setSleep(false);
 
-  // Inicjalizacja protokołu ESP-NOW
-  if (esp_now_init() != 0) {
-    // W przypadku błędu mignij czerwoną diodą (opcjonalna diagnostyka)
-    analogWrite(PIN_R, 255);
-    delay(100);
+  // Maksymalna moc nadawania dla pewnego odsyłania potwierdzeń ACK do Mastera
+  WiFi.setTxPower(WIFI_POWER_19_5dBm);
+
+  // Wymuszenie sztywnego kanału komunikacji zgodnego z Masterem
+  esp_wifi_set_promiscuous(true);
+  esp_wifi_set_channel(WIFI_CHANNEL, WIFI_SECOND_CHAN_NONE);
+  esp_wifi_set_promiscuous(false);
+
+  // Inicjalizacja stosu ESP-NOW
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("Błąd inicjalizacji ESP-NOW!");
+    // Sygnalizacja błędu krótkim mignięciem kanału R
+    analogWrite(PIN_R, 128);
+    delay(150);
     analogWrite(PIN_R, 0);
     return;
   }
 
-  // Ustawienie roli urządzenia
-  esp_now_set_self_role(ESP_NOW_ROLE_SLAVE);
-  
   // Rejestracja funkcji nasłuchującej
   esp_now_register_recv_cb(onDataRecv);
+
+  delay(500);
+  Serial.println("\n=====================================");
+  Serial.println("Slave ESP32-C3 uruchomiony.");
+  Serial.print("Adres MAC do wpisania w Masterze: ");
+  Serial.println(WiFi.macAddress());
+  Serial.println("=====================================");
 }
 
 void loop() {
-  // ESP-NOW działa asynchronicznie (przerwania)
-  // Nie blokujemy pętli głównej
+  // Odbiór pakietów i generowanie PWM odbywają się sprzętowo w tle
 }

@@ -1,5 +1,6 @@
 /*
- * NADAJNIK (MASTER) ESP32 - ESP-NOW + WebServer (Tryb AP)
+ * NADAJNIK (MASTER) ESP32-C3 (Super Mini / Super Mini Plus)
+ * Tryb: Access Point + WebServer + ESP-NOW
  * Funkcje: Maksymalna moc TX (+19.5 dBm), status Online/Offline,
  * kolory stałe R/G/B, tryby migania 1s ON / 1s OFF dla każdego koloru,
  * stroboskop Syreny Policyjnej oraz Watchdog połączenia (5s).
@@ -46,7 +47,7 @@ const SirenFrame SIREN_PATTERN[] = {
 const int SIREN_FRAMES_COUNT = sizeof(SIREN_PATTERN) / sizeof(SIREN_PATTERN[0]);
 
 // =======================================================
-// KONFIGURACJA ODBIORNIKÓW (SLAVES)
+// KONFIGURACJA ODBIORNIKÓW (SLAVES - ESP32-C3)
 // =======================================================
 struct SlaveDevice {
   uint8_t mac[6];
@@ -63,11 +64,11 @@ struct SlaveDevice {
 // Zaktualizuj adresy MAC na te odczytane z Twoich odbiorników
 const int NUM_SLAVES = 5;
 SlaveDevice slaves[NUM_SLAVES] = {
-  {{0xec, 0xfa, 0xbc, 0x28, 0x5c, 0x21}, "Boja 1"}, //ec:fa:bc:28:5c:21
-  {{0x00, 0x00, 0x00, 0x00, 0x00, 0x00}, "Boja 2"}, //empty
-  {{0x00, 0x00, 0x00, 0x00, 0x00, 0x00}, "Boja 2"}, //empty
-  {{0x00, 0x00, 0x00, 0x00, 0x00, 0x00}, "Boja 2"}, //empty
-  {{0x00, 0x00, 0x00, 0x00, 0x00, 0x00}, "Boja 2"}  //empty
+  {{0xe8, 0x3d, 0xc1, 0x84, 0xd8, 0xf0}, "Boja 1"}, //E8:3D:C1:84:D8:F0
+  {{0xe8, 0x3d, 0xc1, 0x84, 0xd8, 0x18}, "Boja 2"}, //E8:3D:C1:84:D8:18
+  {{0xe8, 0x3d, 0xc1, 0x84, 0xd4, 0xec}, "Boja 3"}, //E8:3D:C1:84:D4:EC
+  {{0xe8, 0x3d, 0xc1, 0x84, 0xd9, 0x24}, "Boja 4"}, //E8:3D:C1:84:D9:24
+  {{0xe8, 0x3d, 0xc1, 0x84, 0xcb, 0x44}, "Boja 5"}  //E8:3D:C1:84:CB:44
 };
 
 // Struktura pakietu danych ESP-NOW
@@ -137,7 +138,6 @@ const char index_html[] PROGMEM = R"rawliteral(
     .btn-siren { background: linear-gradient(135deg, #c62828 50%, #1565c0 50%); border-color: #666; }
     .btn-off { background: #424242; border-color: #616161; }
 
-    /* Animacja aktywnego trybu migania / syreny */
     button.active {
       border: 2px solid #ffffff !important;
       animation: btnPulse 1s infinite alternate;
@@ -189,7 +189,7 @@ const char index_html[] PROGMEM = R"rawliteral(
     <div class="error-box">
       <div class="spinner"></div>
       <h3>Utracono połączenie!</h3>
-      <p>Brak odpowiedzi z jednostki głównej (ESP32) od ponad 5 sekund.<br><br>Sprawdź połączenie z siecią Wi-Fi <strong>System_LED_Master</strong>. Panel wróci automatycznie.</p>
+      <p>Brak odpowiedzi z jednostki głównej (ESP32-C3) od ponad 5 sekund.<br><br>Sprawdź połączenie z siecią Wi-Fi <strong>System_LED_Master</strong>. Panel wróci automatycznie.</p>
     </div>
   </div>
 
@@ -295,7 +295,6 @@ const char index_html[] PROGMEM = R"rawliteral(
 
     function startBlinkFromPicker(id) {
       let hex = document.getElementById('color_' + id).value;
-      // Jeśli wybrano czarny (#000000), ustaw domyślnie biały, aby miganie było widoczne
       if (hex === '#000000') {
         hex = '#ffffff';
         document.getElementById('color_' + id).value = hex;
@@ -423,18 +422,19 @@ void sendSteadyStateToSlave(int id) {
 // INICJALIZACJA SYSTEMU
 // =======================================================
 void setup() {
+  // Nieblokująca inicjalizacja USB-CDC (działa także na samym zasilaczu bez PC)
   Serial.begin(115200);
-  Serial.println("\nInicjalizacja Mastera (ESP32)...");
 
-  // 1. Konfiguracja Wi-Fi (Access Point)
+  // 1. Konfiguracja Wi-Fi (Access Point + ESP-NOW na tym samym kanale)
   WiFi.mode(WIFI_AP_STA);
+  WiFi.setAutoReconnect(false); // Blokada skanowania innych kanałów przez część STA
+  WiFi.setSleep(false);         // Wyłączenie oszczędzania energii dla minimalnych opóźnień
   WiFi.softAP(apSSID, apPass, WIFI_CHANNEL, 0, 4);
-  WiFi.disconnect();
 
   // Maksymalna moc nadawania radia (+19.5 dBm)
   WiFi.setTxPower(WIFI_POWER_19_5dBm);
 
-  Serial.print("Access Point uruchomiony. IP: ");
+  Serial.print("\nMaster ESP32-C3 uruchomiony. IP panelu: http://");
   Serial.println(WiFi.softAPIP());
 
   // 2. Inicjalizacja ESP-NOW
@@ -515,7 +515,6 @@ void setup() {
       slaves[id].animStep = 0; // Klatka 0 = ON
       slaves[id].lastAnimTime = millis();
 
-      // Natychmiastowe zapalenie diody w fazie ON
       sendRGB(id, slaves[id].lastR, slaves[id].lastG, slaves[id].lastB);
       server.send(200, "text/plain", "OK");
     } else {
@@ -563,10 +562,8 @@ void loop() {
         slaves[i].animStep = (slaves[i].animStep == 0) ? 1 : 0;
 
         if (slaves[i].animStep == 0) {
-          // Faza 1s ON
           sendRGB(i, slaves[i].lastR, slaves[i].lastG, slaves[i].lastB);
         } else {
-          // Faza 1s OFF
           sendRGB(i, 0, 0, 0);
         }
       }
@@ -583,8 +580,7 @@ void loop() {
     }
   }
 
-  // 2. Heartbeat co 3 sekundy (tylko dla stref w trybie światła ciągłego;
-  //    strefy migające i z syreną odświeżają status Online/Offline przy każdej zmianie klatki)
+  // 2. Heartbeat co 3 sekundy dla stref w trybie światła ciągłego
   if (now - lastPingTime >= PING_INTERVAL) {
     lastPingTime = now;
     for (int i = 0; i < NUM_SLAVES; i++) {
